@@ -8,32 +8,24 @@ from openpyxl import Workbook
 import streamlit as st
 from dotenv import load_dotenv
 
-# Optional: Loads .env if available for local development convenience
 load_dotenv() 
 
 LLM_MODEL = "llama-3.3-70b-versatile"
 
-# ---------------------------------------------------------
-# Function to initialize Groq client based on sidebar input
-# ---------------------------------------------------------
 def init_client(api_key: str):
     """Initializes and returns the Groq client."""
     if not api_key:
         return None, False
 
     try:
-        # Client initialization with the user-provided key
         client = Groq(api_key=api_key)
-        # Quick health check (optional, but good practice)
         client.models.list() 
         return client, True
     except:
         return None, False
 
 
-# ---------------------------------------------------------
-# Pydantic Models (Define the structure of the data)
-# ---------------------------------------------------------
+
 class ExtractedPair(BaseModel):
     """Represents a single row of data for the Excel output."""
     Key: str = Field(description="The determined key/label for the data point.")
@@ -42,7 +34,6 @@ class ExtractedPair(BaseModel):
         alias="Comment",
         description="Residual text from the source or supplementary context. MUST be '' if Key/Value is sufficient."
     )
-    # Allows Pydantic to accept 'Comment' from the LLM JSON and convert it to the internal 'comment' attribute
     model_config = ConfigDict(populate_by_name=True)
 
 
@@ -53,9 +44,7 @@ class DocumentStructure(BaseModel):
     )
 
 
-# ---------------------------------------------------------
-# PDF Extraction
-# ---------------------------------------------------------
+
 @st.cache_data
 def read_pdf_text(uploaded_file: io.BytesIO) -> str:
     """Reads all text content from an uploaded PDF file."""
@@ -74,17 +63,11 @@ def read_pdf_text(uploaded_file: io.BytesIO) -> str:
         return ""
 
 
-# ---------------------------------------------------------
-# Prompt Creation (Optimized for JSON adherence)
-# ---------------------------------------------------------
 def generate_extraction_prompt(document_text: str) -> str:
     """
     Creates the optimized system prompt, using CoT and strict JSON instruction markers.
     """
-    
-    # 1. Generate the expected JSON schema structure from the Pydantic model
-    # We strip out the outer 'DocumentStructure' wrapper in the example to simplify the prompt, 
-    # but the instructions ensure the wrapper is included in the final output.
+   
     schema_template = DocumentStructure.model_json_schema(by_alias=True)
     
     return f"""
@@ -119,9 +102,6 @@ def generate_extraction_prompt(document_text: str) -> str:
     """
 
 
-# ---------------------------------------------------------
-# LLM Extraction
-# ---------------------------------------------------------
 def extract_data_with_llm(client: Groq, document_text: str, progress_bar):
     system_prompt = generate_extraction_prompt(document_text)
 
@@ -154,9 +134,6 @@ def extract_data_with_llm(client: Groq, document_text: str, progress_bar):
         return None
 
 
-# ---------------------------------------------------------
-# Excel File Creator
-# ---------------------------------------------------------
 def create_excel_bytes(extracted_data, progress_bar):
     progress_bar.progress(98, text="98% - Generating Excel...")
 
@@ -165,7 +142,6 @@ def create_excel_bytes(extracted_data, progress_bar):
     ws.append(["Key", "Value", "Comment"])
 
     for item in extracted_data:
-        # model_dump(by_alias=True) ensures "Comment" is used as the key [cite: 1.1]
         row = item.model_dump(by_alias=True)
         ws.append([row["Key"], row["Value"], row["Comment"]])
 
@@ -176,19 +152,14 @@ def create_excel_bytes(extracted_data, progress_bar):
     return stream.getvalue()
 
 
-# ---------------------------------------------------------
-# Streamlit App
-# ---------------------------------------------------------
 def main():
     st.set_page_config(page_title="AI Document Structuring Tool", layout="wide")
     st.title("📄 AI-Powered Document Structuring & Data Extraction")
 
-    # --- Sidebar for API Key Input ---
     with st.sidebar:
         st.header("⚙️ Configuration")
         st.markdown("### 🔑 Enter Your Groq API Key")
 
-        # Input the API Key and store it in session state
         api_key_input = st.text_input(
             label="Groq API Key",
             placeholder="Enter your GROQ_API_KEY here",
@@ -198,7 +169,6 @@ def main():
             help="Your key is used only for this session's API calls."
         )
         
-        # Manually update API_KEY in session state for cross-widget access
         st.session_state["API_KEY"] = api_key_input
 
         client, connected = init_client(st.session_state["API_KEY"])
@@ -212,12 +182,10 @@ def main():
         st.markdown("---")
         st.caption(f"LLM Model: **{LLM_MODEL}**")
 
-    # ------------------ Block UI if no API key ------------------
     if not connected:
         st.warning("Please enter your API key in the sidebar to activate the application.")
         return
 
-    # ------------------ Main UI ------------------
     st.markdown("## ➡️ Process Workflow")
 
     uploaded_file = st.file_uploader("**Step 1:** Upload 'Data Input.pdf'", type=["pdf"])
@@ -225,12 +193,10 @@ def main():
     if uploaded_file:
         st.success(f"Uploaded: {uploaded_file.name}")
 
-        # Invalidate cache if a new file is uploaded
         if uploaded_file.name != st.session_state.get('last_uploaded_file'):
              st.session_state['pdf_content'] = read_pdf_text(uploaded_file)
              st.session_state['last_uploaded_file'] = uploaded_file.name
         
-        # Ensure content is in session state
         if 'pdf_content' not in st.session_state:
              st.session_state['pdf_content'] = read_pdf_text(uploaded_file)
 
@@ -257,16 +223,13 @@ def main():
 
             progress = st.progress(10, text="Starting LLM Processing...")
 
-            # Extract data
             data = extract_data_with_llm(client, pdf_text, progress)
 
             if data:
                 st.subheader("✅ Step 4: Extraction Complete")
 
-                # Create downloadable Excel
                 excel_bytes = create_excel_bytes(data, progress)
                 
-                # Display preview using model_dump(by_alias=True)
                 st.dataframe([d.model_dump(by_alias=True) for d in data], use_container_width=True, height=300)
 
                 st.download_button(
@@ -279,3 +242,4 @@ def main():
             
 if __name__ == "__main__":
     main()
+
