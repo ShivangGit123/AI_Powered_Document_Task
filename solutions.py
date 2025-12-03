@@ -3,40 +3,42 @@ import io
 import json
 from groq import Groq
 from pypdf import PdfReader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from openpyxl import Workbook
 import streamlit as st
 from dotenv import load_dotenv
 
-# --- Configuration & Setup ---
 load_dotenv() # Load environment variables from .env file
 
-# NEW RECOMMENDED MODEL for robust JSON extraction (replacing deprecated Mixtral)
-# Llama 3.3 70B is chosen for its strong instruction following and complex task capability.
 LLM_MODEL = "llama-3.3-70b-versatile" 
 
-# Groq Client Initialization
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 client = None
 if GROQ_API_KEY:
     try:
-        # Note: Groq is compatible with the structuredOutputs setting for reliable JSON
         client = Groq(api_key=GROQ_API_KEY)
     except Exception as e:
         st.error(f"Error initializing Groq client: {e}")
         
-# --- Pydantic Data Model ---
 
 class ExtractedPair(BaseModel):
-    """Represents a single row of data for the Excel output."""
+    """
+    Represents a single row of data for the Excel output. 
+    The field is 'comment' internally but its alias in the JSON output will be 'Comment'.
+    """
+    
     Key: str = Field(description="The determined key/label for the piece of information, decided by the LLM.")
-    Value: str = Field(description="The raw, exact value associated with the Key, preserving original language.")
-    Contextual_Comment: str = Field(description="A note pulled directly from the PDF content that provides context for the pair, or is left empty if Key/Value is sufficient.")
+    Value: str = Field(description="The raw, EXACT value associated with the Key, preserving original wording.")
+    comment: str = Field(
+        alias="Comment",
+        description="Additional text from the source providing context, or left empty ('') if Key/Value is sufficient."
+    )
+    
+    model_config = ConfigDict(populate_by_name=True)
 
 class DocumentStructure(BaseModel):
     """The root model for the structured document output."""
-    # The key 'extracted_data' MUST match this field name exactly.
-    extracted_data: list[ExtractedPair] = Field(description="A list containing all key:value pairs and their contextual comments extracted from the entire document.")
+    extracted_data: list[ExtractedPair] = Field(description="A list containing all key:value pairs and their comments extracted from the entire document.")
 
 # --- Core Functions ---
 
@@ -48,7 +50,6 @@ def read_pdf_text(uploaded_file: io.BytesIO) -> str:
         text = ""
         for i, page in enumerate(reader.pages):
             text += f"\n--- Page {i+1} ---\n"
-            # Attempt to extract text. Use conditional formatting if needed.
             page_text = page.extract_text()
             text += page_text if page_text else "(No readable text on this page)"
         return text.strip()
@@ -57,112 +58,127 @@ def read_pdf_text(uploaded_file: io.BytesIO) -> str:
         return ""
 
 def generate_extraction_prompt(document_text: str) -> str:
-    """Creates the detailed system prompt for the LLM with strict schema enforcement."""
+    """
+    Creates the detailed system prompt, utilizing Chain-of-Thought (CoT) prompting 
+    for strict structural and linguistic fidelity.
+    """
     
     return f"""
     You are an advanced AI Data Structuring and Extraction Engine. Your task is to transform the provided
     unstructured document text into a structured JSON format following the exact Pydantic schema provided.
 
-    ## STRICT REQUIREMENTS:
-    1.  **100% Capture:** You MUST ensure ALL content from the document is captured across the 'Key', 'Value', and 'Contextual_Comment' fields. Nothing is to be lost, summarized, or omitted.
-    2.  **Unstructured to Tabular:** Convert the document's content into a series of logical Key:Value pairs.
-    3.  **Key Determination:** DO NOT pre-define the keys. Determine the most appropriate, concise, and logical 'Key'.
-    4.  **Value Fidelity:** The 'Value' must be the **exact, original wording/phrasing** from the document.
-    5.  **Contextual Comments (CRITICAL CHANGE for Fidelity):**
-        * The 'Contextual_Comment' field MUST contain **additional, related text pulled directly from the source PDF** that adds necessary context or is supplementary to the Key/Value pair.
-        * **If the Key and Value fields already capture the entire logical sentence or phrase, the 'Contextual_Comment' field MUST be left EMPTY ("")** to strictly adhere to the "Preserve Original Language" rule and avoid redundant output.
-    6.  **Schema Enforcement (CRITICAL):** The final JSON object MUST have a **single top-level key** named **'extracted_data'**. DO NOT categorize the data into custom keys like 'Personal_Details' or 'Sections'.
+    ## PROCESSING METHODOLOGY (MANDATORY CHAIN-OF-THOUGHT):
+    You MUST process the document by following these steps for every unique sentence or clause:
+    1.  **IDENTIFY SOURCE:** Select one complete, logical sentence or clause from the document text.
+    2.  **EXTRACT CORE VALUE:** From that source, extract the single, most important factual metric or phrase. This is the **Value**.
+    3.  **DETERMINE KEY:** Create the most appropriate, concise, and logical **Key** for the fact identified in Step 2.
+    4.  **CAPTURE CONTEXT/RESIDUAL:** Place any remaining associated text from the *original source sentence* that was NOT used in the Key or Value into the **Comment**. If the Key and Value capture the entire logical idea, the comment MUST be **EMPTY ("")**.
+
+    ## STRICT RULES FOR FIDELITY:
+    1.  **100% Data Capture:** All content MUST be captured across the three columns (Key, Value, Comment). Nothing is summarized or omitted.
+    2.  **Language Preservation (CRITICAL):**
+        * The **Value** MUST **Retain the exact original wording, sentence structure, and phrasing from the PDF**.
+        * **Avoid paraphrasing unless required to form a clean key:value pair**.
+        * **Do not introduce new information** or fabricate details.
+    3.  **Schema Enforcement:** The final JSON object MUST have a **single top-level key** named **'extracted_data'**. DO NOT categorize the data into custom keys.
 
     ## EXAMPLE OUTPUT FORMAT:
-    // This example is for structure only. Content must reflect the input PDF.
+    // Note the use of "Comment" as the field name, reflecting the alias.
     {{
         "extracted_data": [
             {{
                 "Key": "Assignment Title",
                 "Value": "AI-Powered Document Structuring & Data Extraction Task",
-                "Contextual_Comment": "" // Example of an empty comment
+                "Comment": "" 
             }},
             {{
-                "Key": "Undergraduate GPA Context",
-                "Value": "8.7",
-                "Contextual_Comment": "On a 10-point scale." // Example of a required context
+                "Key": "Undergraduate Graduation Context",
+                "Value": "Graduating with honors",
+                "Comment": "ranking 15th among 120 students in his class." 
             }}
         ]
     }}
 
-    ## DOCUMENT TEXT TO BE PROCESSED:
+    ## DOCUMENT TEXT TO BE PROCESSED (Chunked Input):
     ---
     {document_text}
     ---
     """
 
-def extract_data_with_llm(document_text: str) -> list[ExtractedPair] | None:
+def extract_data_with_llm(document_text: str, progress_bar) -> list[ExtractedPair] | None:
     """Calls the Groq API to perform the structured data extraction."""
     
     system_prompt = generate_extraction_prompt(document_text)
     
     try:
-        with st.spinner(f"🚀 Processing document with Groq LLM ({LLM_MODEL})..."):
-            chat_completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Process the provided document text and return the structured JSON output adhering strictly to the Pydantic schema."}
-                ],
-                model=LLM_MODEL,
-                response_format={"type": "json_object"},
-                temperature=0.0
-            )
+        progress_bar.progress(60, text="60% - Sending data to Groq LLM for extraction...")
+        
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Process the provided document text and return the structured JSON output adhering strictly to the Pydantic schema."}
+            ],
+            model=LLM_MODEL,
+            response_format={"type": "json_object"},
+            temperature=0.0
+        )
+        
+        progress_bar.progress(80, text="80% - Validating and parsing LLM output...")
         
         json_string = chat_completion.choices[0].message.content
         data_model = DocumentStructure.model_validate_json(json_string)
         
+        progress_bar.progress(95, text="95% - Data validated successfully.")
         return data_model.extracted_data
         
     except Exception as e:
+        progress_bar.empty()
         st.error(f"❌ An error occurred during LLM API call or JSON parsing. Details: {e}")
-        st.caption("The LLM might have returned a JSON that violated the strict 'extracted_data' list structure. Review the LLM logs if possible.")
+        st.caption("The model failed to adhere to the strict JSON schema (likely missing the 'extracted_data' key or violating the list structure).")
         return None
 
-def create_excel_bytes(extracted_data: list[ExtractedPair]) -> bytes:
+def create_excel_bytes(extracted_data: list[ExtractedPair], progress_bar) -> bytes:
     """Creates an Excel file in memory (BytesIO) and returns the bytes."""
+    progress_bar.progress(98, text="98% - Generating Excel file in memory...")
+    
     wb = Workbook()
     ws = wb.active
     
-    # Set headers
-    headers = ["Key", "Value", "Contextual_Comment"]
+    headers = ["Key", "Value", "Comment"] 
     ws.append(headers)
     
     # Write data rows
     for item in extracted_data:
-        # Using .model_dump() for dictionary conversion
-        row = [item.Key, item.Value, item.Contextual_Comment]
+        row_dict = item.model_dump(by_alias=True) 
+        row = [row_dict['Key'], row_dict['Value'], row_dict['Comment']]
         ws.append(row)
         
-    # Save to a BytesIO object
     excel_stream = io.BytesIO()
     wb.save(excel_stream)
     excel_bytes = excel_stream.getvalue()
     
+    progress_bar.progress(100, text="100% - File ready for download!")
     return excel_bytes
 
-# --- Streamlit UI ---
+
 
 def main():
     st.set_page_config(page_title="AI Document Structuring Tool", layout="wide")
     st.title("📄 AI-Powered Document Structuring & Data Extraction")
-    st.markdown("Automating the conversion of unstructured PDF text into a structured Excel table using Groq's high-speed LLMs.")
+    st.markdown("A solution to convert unstructured PDF text into a structured Excel format, emphasizing **100% data fidelity** and **original language preservation**.")
 
-    # --- Sidebar for Status and Settings ---
+    
     with st.sidebar:
         st.header("⚙️ Configuration")
         if client:
             st.success("API Status: Connected to GroqCloud")
-            st.info(f"LLM Model: **{LLM_MODEL}** (Selected for high structured output fidelity)")
+            st.info(f"LLM Model: **{LLM_MODEL}**")
+            st.info("Strategy: Explicit Chain-of-Thought (CoT) Prompting")
         else:
             st.error("API Status: Disconnected (Key Missing)")
-            st.warning("Please set your `GROQ_API_KEY` environment variable.")
+            st.warning("Please set your `GROQ_API_KEY` environment variable in the `.env` file.")
         st.markdown("---")
-        st.markdown(f"**Note:** The previous `mixtral-8x7b-32768` model has been officially decommissioned. We use **{LLM_MODEL}** as the replacement.")
+        st.caption("Using Llama 3.3 for high-fidelity extraction after Mixtral was decommissioned.")
 
     if client is None:
         st.warning("""
@@ -172,68 +188,71 @@ def main():
         return
 
     # --- Main Application Steps ---
-
-    st.subheader("1. Upload Input Document")
+    st.markdown("## ➡️ Process Workflow")
+    
     uploaded_file = st.file_uploader(
-        "Upload your 'Data Input.pdf' here:", 
+        "**Step 1:** Upload your 'Data Input.pdf' here:", 
         type=["pdf"], 
-        help="The document must be text-readable. No OCR support is built-in for image-only files."
+        key="file_uploader",
+        help="The document must be text-readable (not a scanned image)."
     )
-
+    
     if uploaded_file is not None:
         st.success(f"File uploaded: **{uploaded_file.name}**")
         
+        # --- Step 2 & 3: Read and Run Buttons ---
         col1, col2 = st.columns(2)
         
+        # Ensure content is extracted before processing
+        if 'pdf_content' not in st.session_state or st.session_state.get('last_uploaded_file') != uploaded_file.name:
+            st.session_state['pdf_content'] = read_pdf_text(uploaded_file)
+            st.session_state['last_uploaded_file'] = uploaded_file.name
+
         with col1:
-            if st.button("2. 🔍 Preview Extracted Text", use_container_width=True):
-                # Read PDF content
-                pdf_content = read_pdf_text(uploaded_file)
-                if pdf_content:
-                    st.session_state['pdf_content'] = pdf_content
-                    st.caption("First 500 characters of extracted text (for verification):")
-                    st.code(pdf_content[:500] + "...", language="text")
-                else:
-                    st.error("Could not extract text. Please check the PDF file.")
+            if st.button("2. 🔍 Preview Extracted Text", use_container_width=True, key="btn_preview"):
+                st.success("Text extraction complete.")
+                with st.expander("Review Extracted Text"):
+                    st.code(st.session_state['pdf_content'][:1000] + "\n...", language="text")
 
         with col2:
-            # Only enable the run button if content is ready or file is uploaded
-            process_button = st.button("3. ⚡ Run Data Extraction (LLM)", type="primary", use_container_width=True, 
-                                       disabled='pdf_content' not in st.session_state and uploaded_file is None)
+            process_button = st.button("3. ⚡ Run Data Structuring (LLM)", type="primary", use_container_width=True, key="btn_process")
             
         st.markdown("---")
 
+        # --- Step 4: Processing Logic and Results ---
+        
         if process_button:
-            # Ensure PDF content is loaded before running
-            if 'pdf_content' not in st.session_state or st.session_state['pdf_content'] is None:
-                st.session_state['pdf_content'] = read_pdf_text(uploaded_file)
-            
             pdf_content = st.session_state['pdf_content']
             
             if not pdf_content:
-                st.warning("No content found to process. Please ensure the PDF is uploaded and text extraction is successful.")
+                st.warning("Text extraction failed. Cannot proceed.")
                 return
 
+            # Initialize progress bar
+            progress_bar = st.progress(10, text="10% - Starting LLM processing...")
+            
             # Extract data using LLM
-            structured_data = extract_data_with_llm(pdf_content)
+            structured_data = extract_data_with_llm(pdf_content, progress_bar)
 
             if structured_data:
-                st.subheader("4. Extracted Data Output (Preview)")
-                st.success(f"✅ Extraction Successful! **{len(structured_data)}** Key:Value pairs captured.")
-
-                # Display the extracted data in an interactive table
-                st.dataframe([d.model_dump() for d in structured_data], use_container_width=True, height=300)
-
+                st.subheader("✅ Extraction Complete: Results")
+                
                 # Create downloadable Excel
-                excel_bytes = create_excel_bytes(structured_data)
+                excel_bytes = create_excel_bytes(structured_data, progress_bar)
+                
+                st.success(f"**{len(structured_data)}** Key:Value pairs captured and structured.")
+
+                st.dataframe([d.model_dump(by_alias=True) for d in structured_data], use_container_width=True, height=300)
+
                 st.download_button(
                     label="⬇️ Download Expected Output.xlsx",
                     data=excel_bytes,
                     file_name="Expected_Output_Structured_Data.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    help="The output is guaranteed to follow the strict Key, Value, Contextual_Comment structure.",
+                    help="Final output adhering to all fidelity and structuring requirements.",
                     key="download_button"
                 )
+                progress_bar.empty()
             
 if __name__ == "__main__":
     main()
